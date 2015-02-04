@@ -1,10 +1,10 @@
 /*
     Musical Spectrum plugin for the DeaDBeeF audio player
 
-    Copyright (C) 2014 Christian Boxdörfer <christian.boxdoerfer@posteo.de>
+    Copyright (C) 2015 Christian Boxdörfer <christian.boxdoerfer@posteo.de>
 
     Based on DeaDBeeFs stock spectrum.
-    Copyright (c) 2009-2014 Alexey Yakovenko <waker@users.sourceforge.net>
+    Copyright (c) 2009-2015 Alexey Yakovenko <waker@users.sourceforge.net>
     Copyright (c) 2011 William Pitcock <nenolod@dereferenced.org>
 
     This program is free software; you can redistribute it and/or
@@ -100,9 +100,12 @@ do_fft (w_spectrum_t *w)
     deadbeef->mutex_unlock (w->mutex);
 }
 
+static int need_redraw = 0;
+
 static int
 on_config_changed (gpointer user_data, uintptr_t ctx)
 {
+    need_redraw = 1;
     w_spectrum_t *w = user_data;
     load_config ();
     deadbeef->mutex_lock (w->mutex);
@@ -151,6 +154,10 @@ w_spectrum_destroy (ddb_gtkui_widget_t *w) {
     if (s->surf) {
         cairo_surface_destroy (s->surf);
         s->surf = NULL;
+    }
+    if (s->surf_data) {
+        free (s->surf_data);
+        s->surf_data = NULL;
     }
     if (s->mutex) {
         deadbeef->mutex_free (s->mutex);
@@ -214,13 +221,13 @@ spectrum_interpolate (gpointer user_data, int bands, int index)
 
         // find index of next value
         int j = 0;
-        while (index+j < CONFIG_NUM_BARS && w->keys[index+j] == w->keys[index]) {
+        while (index+j < bands && w->keys[index+j] == w->keys[index]) {
             j++;
         }
         const float v2 = 10 * log10 (w->spectrum_data[w->keys[index+j]]);
 
         int l = j;
-        while (index+l < CONFIG_NUM_BARS && w->keys[index+l] == w->keys[index+j]) {
+        while (index+l < bands && w->keys[index+l] == w->keys[index+j]) {
             l++;
         }
         const float v3 = 10 * log10 (w->spectrum_data[w->keys[index+l]]);
@@ -257,6 +264,53 @@ spectrum_interpolate (gpointer user_data, int bands, int index)
     return x;
 }
 
+static void
+draw_static_content (unsigned char *data, int stride, int bands, int width, int height)
+{
+    if (!data) {
+        return;
+    }
+    memset (data, 0, height * stride);
+
+    int barw;
+    if (CONFIG_GAPS || CONFIG_BAR_W > 1)
+        barw = CLAMP (width / bands, 2, 20);
+    else
+        barw = CLAMP (width / bands, 2, 20) - 1;
+
+    const int left = get_align_pos (width, bands, barw);
+
+    //draw background
+    _draw_background (data, width, height, CONFIG_COLOR_BG32);
+    // draw vertical grid
+    if (CONFIG_ENABLE_VGRID && CONFIG_GAPS) {
+        int num_lines = MIN (width/barw, bands);
+        for (int i = 0; i < num_lines; i++) {
+            _draw_vline (data, stride, left + barw * i, 0, height-1, CONFIG_COLOR_VGRID32);
+        }
+    }
+
+    // draw octave grid
+    if (CONFIG_ENABLE_OCTAVE_GRID) {
+        int num_lines = MIN (width/barw, bands);
+        int spectrum_width = MIN (barw * bands, width);
+        float octave_width = CLAMP (((float)spectrum_width / 11), 1, spectrum_width);
+        int x = 0;
+        for (float i = left; i < spectrum_width - 1 && i < width - 1; i += octave_width) {
+            x = ftoi (i) + (CONFIG_GAPS ? (ftoi (i) % barw) : 0);
+            _draw_vline (data, stride, x, 0, height-1, CONFIG_COLOR_OCTAVE_GRID32);
+        }
+    }
+
+    const int hgrid_num = CONFIG_DB_RANGE/10;
+    // draw horizontal grid
+    if (CONFIG_ENABLE_HGRID && height > 2*hgrid_num && width > 1) {
+        for (int i = 1; i < hgrid_num; i++) {
+            _draw_hline (data, stride, 0, ftoi (i/(float)hgrid_num * height), width-1, CONFIG_COLOR_HGRID32);
+        }
+    }
+}
+
 static gboolean
 spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     w_spectrum_t *w = user_data;
@@ -267,12 +321,13 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     GtkAllocation a;
     gtk_widget_get_allocation (w->drawarea, &a);
 
-    static int last_bar_w = 1000;
-    if (a.width != last_bar_w)
+    static int last_bar_w = 0;
+    if (a.width != last_bar_w) {
         create_frequency_table(w);
+    }
     last_bar_w = a.width;
 
-    const int bands = CONFIG_NUM_BARS;
+    const int bands = get_num_bars ();
     const int width = a.width;
     const int height = a.height;
 
@@ -343,12 +398,20 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     }
 
     // start drawing
-    if (!w->surf || cairo_image_surface_get_width (w->surf) != a.width || cairo_image_surface_get_height (w->surf) != a.height) {
+    int stride = 0;
+    if (!w->surf || !w->surf_data || cairo_image_surface_get_width (w->surf) != a.width || cairo_image_surface_get_height (w->surf) != a.height) {
+        need_redraw = 1;
         if (w->surf) {
             cairo_surface_destroy (w->surf);
             w->surf = NULL;
         }
+        if (w->surf_data) {
+            free (w->surf_data);
+            w->surf_data = NULL;
+        }
         w->surf = cairo_image_surface_create (CAIRO_FORMAT_RGB24, a.width, a.height);
+        stride = cairo_image_surface_get_stride (w->surf);
+        w->surf_data = malloc (stride * a.height);
     }
     const float base_s = (height / (float)CONFIG_DB_RANGE);
 
@@ -358,8 +421,16 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     if (!data) {
         return FALSE;
     }
-    const int stride = cairo_image_surface_get_stride (w->surf);
-    memset (data, 0, a.height * stride);
+
+    stride = cairo_image_surface_get_stride (w->surf);
+    if (need_redraw) {
+        draw_static_content (data, stride, bands, a.width, a.height);
+        memcpy (w->surf_data, data, stride * a.height);
+        need_redraw = 0;
+    }
+    else {
+        memcpy (data, w->surf_data, stride * a.height);
+    }
 
     int barw;
     if (CONFIG_GAPS || CONFIG_BAR_W > 1)
@@ -369,32 +440,10 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
 
     const int left = get_align_pos (a.width, bands, barw);
 
-    //draw background
-    _draw_background (data, a.width, a.height, CONFIG_COLOR_BG32);
-    // draw vertical grid
-    if (CONFIG_ENABLE_VGRID && CONFIG_GAPS) {
-        int num_lines = MIN (a.width/barw, bands);
-        for (int i = 0; i < num_lines; i++) {
-            _draw_vline (data, stride, left + barw * i, 0, a.height-1, CONFIG_COLOR_VGRID32);
-        }
-    }
-
-    const int hgrid_num = CONFIG_DB_RANGE/10;
-    // draw horizontal grid
-    if (CONFIG_ENABLE_HGRID && a.height > 2*hgrid_num && a.width > 1) {
-        for (int i = 1; i < hgrid_num; i++) {
-            _draw_hline (data, stride, 0, ftoi (i/(float)hgrid_num * a.height), a.width-1, CONFIG_COLOR_HGRID32);
-        }
-    }
-
     for (gint i = 0; i < bands; i++)
     {
         int x = left + barw * i;
         int y = a.height - ftoi (w->bars[i] * base_s);
-        if (y < 0) {
-            y = 0;
-        }
-
         int bw;
 
         if (CONFIG_GAPS) {
@@ -408,24 +457,26 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
         if (x + bw >= a.width) {
             bw = a.width-x-1;
         }
-        if (CONFIG_GRADIENT_ORIENTATION == 0) {
-            if (CONFIG_ENABLE_BAR_MODE == 0) {
-                _draw_bar_gradient_v (w->colors, data, stride, x, y, bw, a.height-y, a.height);
+        if (y > 0) {
+            if (CONFIG_GRADIENT_ORIENTATION == 0) {
+                if (CONFIG_ENABLE_BAR_MODE == 0) {
+                    _draw_bar_gradient_v (w->colors, data, stride, x, y, bw, a.height-y, a.height);
+                }
+                else {
+                    _draw_bar_gradient_bar_mode_v (w->colors, data, stride, x, y, bw, a.height-y, a.height);
+                }
             }
             else {
-                _draw_bar_gradient_bar_mode_v (w->colors, data, stride, x, y, bw, a.height-y, a.height);
-            }
-        }
-        else {
-            if (CONFIG_ENABLE_BAR_MODE == 0) {
-                _draw_bar_gradient_h (w->colors, data, stride, x, y, bw, a.height-y, a.width);
-            }
-            else {
-                _draw_bar_gradient_bar_mode_h (w->colors, data, stride, x, y, bw, a.height-y, a.width);
+                if (CONFIG_ENABLE_BAR_MODE == 0) {
+                    _draw_bar_gradient_h (w->colors, data, stride, x, y, bw, a.height-y, a.width);
+                }
+                else {
+                    _draw_bar_gradient_bar_mode_h (w->colors, data, stride, x, y, bw, a.height-y, a.width);
+                }
             }
         }
         y = a.height - w->peaks[i] * base_s;
-        if (y < a.height-1) {
+        if (y > 0 && y < a.height-1) {
             if (CONFIG_GRADIENT_ORIENTATION == 0) {
                 _draw_bar_gradient_v (w->colors, data, stride, x, y, bw, 1, a.height);
             }
@@ -436,12 +487,8 @@ spectrum_draw (GtkWidget *widget, cairo_t *cr, gpointer user_data) {
     }
 
     cairo_surface_mark_dirty (w->surf);
-
-    cairo_save (cr);
     cairo_set_source_surface (cr, w->surf, 0, 0);
-    cairo_rectangle (cr, 0, 0, a.width, a.height);
-    cairo_fill (cr);
-    cairo_restore (cr);
+    cairo_paint (cr);
 
     return FALSE;
 }
@@ -499,18 +546,19 @@ spectrum_motion_notify_event (GtkWidget *widget, GdkEventButton *event, gpointer
     GtkAllocation a;
     gtk_widget_get_allocation (widget, &a);
 
+    const int num_bars = get_num_bars ();
     int barw;
 
     if (CONFIG_GAPS)
-        barw = CLAMP (a.width / CONFIG_NUM_BARS, 2, 20);
+        barw = CLAMP (a.width / num_bars, 2, 20);
     else
-        barw = CLAMP (a.width / CONFIG_NUM_BARS, 2, 20) - 1;
+        barw = CLAMP (a.width / num_bars, 2, 20) - 1;
 
-    const int left = get_align_pos (a.width, CONFIG_NUM_BARS, barw);
+    const int left = get_align_pos (a.width, num_bars, barw);
 
-    if (event->x > left && event->x < left + barw * CONFIG_NUM_BARS) {
-        int pos = CLAMP ((int)((event->x-1-left)/barw),0,CONFIG_NUM_BARS-1);
-        int npos = ftoi( pos * 132 / CONFIG_NUM_BARS );
+    if (event->x > left && event->x < left + barw * num_bars) {
+        int pos = CLAMP ((int)((event->x-1-left)/barw),0,num_bars-1);
+        int npos = ftoi( pos * 132 / num_bars );
         char tooltip_text[20];
         snprintf (tooltip_text, sizeof (tooltip_text), "%5.0f Hz (%s)", w->freq[pos], notes[npos]);
         gtk_widget_set_tooltip_text (widget, tooltip_text);
@@ -678,7 +726,7 @@ musical_spectrum_disconnect (void)
 static const char settings_dlg[] =
     "property \"Refresh interval (ms): \"       spinbtn[10,1000,1] "        CONFSTR_MS_REFRESH_INTERVAL         " 25 ;\n"
     "property \"Number of bars: \"              spinbtn[2,2000,1] "         CONFSTR_MS_NUM_BARS                 " 132 ;\n"
-    "property \"Bar width (0 - auto):               \"     spinbtn[0,10,1] "           CONFSTR_MS_BAR_W                    " 1 ;\n"
+    "property \"Bar width (0 - auto): \"        spinbtn[0,10,1] "           CONFSTR_MS_BAR_W                    " 0 ;\n"
     "property \"Gap between bars  \"            checkbox "                  CONFSTR_MS_GAPS                     " 1 ;\n"
     "property \"Bar falloff (dB/s): \"          spinbtn[-1,1000,1] "        CONFSTR_MS_BAR_FALLOFF              " -1 ;\n"
     "property \"Bar delay (ms): \"              spinbtn[0,10000,100] "      CONFSTR_MS_BAR_DELAY                " 0 ;\n"
@@ -692,7 +740,7 @@ DB_misc_t plugin = {
     .plugin.api_vmajor      = 1,
     .plugin.api_vminor      = 5,
     .plugin.version_major   = 0,
-    .plugin.version_minor   = 1,
+    .plugin.version_minor   = 2,
 #if GTK_CHECK_VERSION(3,0,0)
     .plugin.id              = "musical_spectrum-gtk3",
 #else
@@ -701,7 +749,7 @@ DB_misc_t plugin = {
     .plugin.name            = "Musical Spectrum",
     .plugin.descr           = "Musical Spectrum",
     .plugin.copyright       =
-        "Copyright (C) 2013 Christian Boxdörfer <christian.boxdoerfer@posteo.de>\n"
+        "Copyright (C) 2015 Christian Boxdörfer <christian.boxdoerfer@posteo.de>\n"
         "\n"
         "Based on DeaDBeeFs stock spectrum.\n"
         "\n"
